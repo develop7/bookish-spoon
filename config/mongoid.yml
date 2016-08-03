@@ -1,0 +1,6 @@
+development:
+  clients:
+    default:
+      database: "geo_tasks"
+      hosts:
+        - "localhost:27017"
