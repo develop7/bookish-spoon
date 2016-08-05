@@ -12,7 +12,10 @@ class Task
 
   field :name, type: String
   field :auth_token, type: String
-  field :location, type: Point, sphere: true
+  field :pickup_location, type: Point, sphere: true
+  field :delivery_location, type: Point
+
+  validates_presence_of :name, :auth_token, :pickup_location, :delivery_location
 
   include AASM
   field :aasm_state
@@ -38,39 +41,94 @@ class GeoTasksApp < Sinatra::Application
 
   USER_TYPES = %i(manager driver)
 
+  # This function reads "Authentication" request header and authorizes to perform certain operation
   # @param [Symbol] type Authorization type, can be :manager or :driver
   def authorize!(type)
     raise OperationNotSupportedError.new('Unsupported authorization type') unless USER_TYPES.include?(type)
 
     auth = env['HTTP_AUTHENTICATION']
-    pp env
 
     halt 403, 'Use "Authentication:" header' unless auth
 
-    halt 403, 'User type mismatch' unless auth[0].downcase == type[0].to_s.downcase # manager's tokens should start with 'M' and drivers' with 'D' accordingly
+    # A shortcut follows: we check \if first character of +auth+ is equal to first char of +type+
+    # So managers' tokens should start with 'M' and drivers' with 'D' in order to be authorized
+    halt 403, 'User type mismatch' unless auth[0].downcase == type[0].downcase
 
     auth
   end
 
-  get '/' do
-    'Hullo zeeba neiba!'
-  end
-
   post '/tasks' do
-    token = authorize!(:manager)
+    token = authorize! :manager
 
     form = JSON.parse(request.body.read, symbolize_names: true)
 
     t = Task.new(form.merge({auth_token: token}))
 
     if t.valid?
-      t.save.to_json
+      t.save
+
+      JSON.generate({id: t.id})
     else
-      pp t.errors, t
+      JSON.generate(t.errors.to_hash(true))
     end
   end
 
   get '/tasks' do
-    # ze_coll.find({pickup_coord: {'$nearSphere' => {'$geometry' => {type: "Point", coordinates: [-73.93414657, 40.82302903]}, '$maxDistance' => 5 * 10_000}}})
+    content_type 'application/x-json'
+    authorize! :driver
+
+    to_f = -> (s) { Float(s)}
+
+    lat, lon = [params['lat'], params['lon']].map(&to_f)
+    radius = params['radius'] || 10_000 # 10 km
+    halt 412 unless lat && lon
+
+    # use .collection.find, because :pickup_location.near_sphere doesn't work (requires '$geometry' parameter which
+    # doesn't get serialized properly - array gets serialized to `{0: 123, 1: 234}`-like hash instead of `[123, 234]`)
+    tasks = Task.collection.find(
+        pickup_location: {'$nearSphere' => {
+            '$geometry' => {type: 'Point', coordinates: [lat, lon]},
+            '$maxDistance' => radius}},
+        aasm_state: :created
+    )
+
+    tasks.to_json
+  end
+
+  post '/tasks/:id/assign' do
+    content_type 'application/x-json'
+    token = authorize! :driver
+
+    t = Task.where(id: params['id'], aasm_state: :created).first
+
+    halt 404 unless t
+
+    t.assign
+    t.auth_token = token # replace token with drivers'
+
+    if t.save
+      halt 204, 'Assigned'
+    else
+      halt 500
+      pp t.errors
+    end
+  end
+
+  post '/tasks/:id/deliver' do
+    content_type 'application/x-json'
+    authorize! :driver
+
+    t = Task.where(id: params['id'], aasm_state: :assigned).first
+
+    halt 404 unless t
+
+    t.deliver
+
+    if t.save
+      halt 204, 'Delivered'
+    else
+      halt 500
+      pp t.errors
+    end
   end
 end
